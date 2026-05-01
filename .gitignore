@@ -1,0 +1,12 @@
+# Cursor / IDE
+.cursor/
+
+# Build output (built with scripts/Build.ps1)
+/release/
+
+# Compiled binaries anywhere in repo
+*.exe
+
+# Windows
+Thumbs.db
+desktop.ini
