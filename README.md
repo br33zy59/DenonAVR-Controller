@@ -1,16 +1,6 @@
 # Denon AVR Controller
 
-Small Windows GUI for controlling a Denon or Marantz network receiver over the classic ASCII **TCP port 23** control channel (often described as Telnet-like).
-
-## Layout
-
-| Path | Description |
-|------|--------------|
-| `src/DenonAVR.standalone.ps1` | Source script |
-| `assets/DenonAVR.ico` | Application icon |
-| `scripts/Build.ps1` | Builds `release/DenonAVR.exe` with [ps2exe](https://github.com/MScholtes/PS2EXE) |
-
-The `release/` folder (and `.exe` files) are intentionally **ignored by Git**.
+Small Windows GUI for controlling a Denon or Marantz network receiver over Telnet **TCP port 23**.
 
 ## Requirements
 
@@ -42,26 +32,6 @@ Ensure no other application has the receiver’s TCP control session open at the
    ```
 
 The executable is written to `release\DenonAVR.exe`.
-
-## Publishing to GitHub
-
-If GitHub CLI is installed and authenticated:
-
-```powershell
-gh auth login
-gh repo create DenonAVR-Controller --public --source=. --remote=origin --push
-```
-
-If you prefer the web UI, create an empty repository, then:
-
-```powershell
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
-git push -u origin main
-```
 
 ## Disclaimer
 
