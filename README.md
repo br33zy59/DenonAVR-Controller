@@ -1,11 +1,15 @@
 # Denon AVR Controller
 
-Small Windows GUI for controlling a Denon or Marantz network receiver over Telnet **TCP port 23**.
+A simple tool to control a Denon or Marantz network receiver over LAN from your Windows PC/Laptop. Uses Telnet (TCP port 23).
+
+![Screenshot of the GUI](assets/DenonAVR-Controller_GUI.PNG)
 
 ## Requirements
 
 - Windows PowerShell 5.1
 - [.NET Framework](https://dotnet.microsoft.com/download/dotnet-framework) (WinForms assemblies load at runtime)
+- Tested against a Denon X1600H Receiver but should work on a broad range of Denon and Marantz models
+- Enable Settings -> Network -> Network control on the receiver settings
 
 ## Run without building
 
