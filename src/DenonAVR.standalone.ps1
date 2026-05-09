@@ -157,6 +157,29 @@ function Disconnect-DenonAVR {
     }
 }
 
+function Test-DenonAddressFormat {
+    param(
+        [string]$Address
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Address)) {
+        return $false
+    }
+
+    $a = $Address.Trim()
+    if ($a -match '^https?://') {
+        return $false
+    }
+
+    $ip = $null
+    if ([System.Net.IPAddress]::TryParse($a, [ref]$ip)) {
+        return $true
+    }
+
+    # Trivial hostname validation (letters/digits/hyphens; dot-separated labels).
+    return ($a -match '^(?=.{1,253}$)(?:(?!-)[A-Za-z0-9-]{1,63}(?<!-)\.)*(?!-)[A-Za-z0-9-]{1,63}(?<!-)$')
+}
+
 function Set-DenonInputComboFromRawSi {
     param(
         $Combo,
@@ -615,7 +638,7 @@ function Show-DenonGUI {
     # Main form
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Denon AVR Controller"
-    $form.Size = New-Object System.Drawing.Size(550, 705)
+    $form.Size = New-Object System.Drawing.Size(500, 705)
     $form.StartPosition = "CenterScreen"
     try {
         $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
@@ -754,7 +777,7 @@ function Show-DenonGUI {
     # Status box
     $txtStatus = New-Object System.Windows.Forms.TextBox
     $txtStatus.Location = New-Object System.Drawing.Point(20,338)
-    $txtStatus.Size = New-Object System.Drawing.Size(500,220)
+    $txtStatus.Size = New-Object System.Drawing.Size(420,220)
     $txtStatus.Multiline = $true
     $txtStatus.ScrollBars = "Vertical"
     $txtStatus.ReadOnly = $true
@@ -772,7 +795,8 @@ function Show-DenonGUI {
     $btnRefresh = New-Object System.Windows.Forms.Button
     $btnRefresh.Text = "Refresh Status"
     $btnRefresh.Location = New-Object System.Drawing.Point(20,600)
-    $btnRefresh.Size = New-Object System.Drawing.Size(500,40)
+    $btnRefresh.Size = New-Object System.Drawing.Size(420,40)
+    $btnRefresh.Enabled = $false
     $form.Controls.Add($btnRefresh)
 
     # Helper: update red zone based on Max
@@ -918,6 +942,7 @@ function Show-DenonGUI {
         $btnDisconnect.Enabled = $isConnectedUi
         $btnConnect.Enabled = (-not $isConnectedUi)
         $cmbInput.Enabled = $isConnectedUi
+        $btnRefresh.Enabled = $isConnectedUi
 
         # Power buttons: mutually exclusive enabled state when connected; both off when disconnected
         if (-not $isConnectedUi) {
@@ -1075,6 +1100,10 @@ function Show-DenonGUI {
             $target = $txtHost.Text.Trim()
             if (-not $target) {
                 $lblStatus.Text = "Status: No address entered"
+                return
+            }
+            if (-not (Test-DenonAddressFormat -Address $target)) {
+                $lblStatus.Text = "Status: Invalid address (use hostname or IP)"
                 return
             }
 
