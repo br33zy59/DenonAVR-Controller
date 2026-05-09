@@ -4,6 +4,10 @@ $Global:DenonStream = $null
 $Global:DenonWriter = $null
 $Global:DenonReader = $null
 $Global:VolumeGuard = $false
+$Global:DenonHttpOk = $false
+$Global:DenonSsfunMap = @{}
+$Global:DenonLastRawSi = $null
+$Global:DenonSuppressInputComboEvent = $false
 
 $DenonInputMap = @{
     "SITV"     = "TV"
@@ -86,8 +90,57 @@ function Connect-DenonAVR {
     $Global:DenonWriter = New-Object System.IO.StreamWriter($Global:DenonStream)
     $Global:DenonReader = New-Object System.IO.StreamReader($Global:DenonStream)
     $Global:DenonWriter.AutoFlush = $true
+}
 
-    Update-Status "Connected to ${Address}:$Port"
+# Probes Deviceinfo.xml plus a main-zone status XML path (responses discarded).
+function Test-DenonHttpXmlEndpoints {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HostAddress,
+
+        [int]$TimeoutSec = 3
+    )
+
+    $hostOnly = ($HostAddress -replace '^https?://', '').Split('/', 2)[0].Trim()
+
+    if (-not $hostOnly) {
+        return $false
+    }
+
+    $deviceinfoUrl =
+        ('http://{0}/goform/Deviceinfo.xml' -f $hostOnly)
+    $statusUrls = @(
+        ('http://{0}/goform/formMainZone_MainZoneXmlStatusLite.xml' -f $hostOnly)
+        ('http://{0}/goform/formMainZone_MainZoneXml.xml' -f $hostOnly)
+    )
+
+    $uriParam = @{ Uri = ''; UseBasicParsing = $true; TimeoutSec = $TimeoutSec; ErrorAction = 'Stop' }
+
+    try {
+        $uriParam.Uri = $deviceinfoUrl
+        $rDevice = Invoke-WebRequest @uriParam
+        if ($rDevice.StatusCode -ne 200 -or [string]::IsNullOrWhiteSpace($rDevice.Content)) {
+            return $false
+        }
+    }
+    catch {
+        return $false
+    }
+
+    foreach ($uri in $statusUrls) {
+        try {
+            $uriParam.Uri = $uri
+            $rStatus = Invoke-WebRequest @uriParam
+            if ($rStatus.StatusCode -eq 200 -and -not [string]::IsNullOrWhiteSpace($rStatus.Content)) {
+                return $true
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    return $false
 }
 
 function Disconnect-DenonAVR {
@@ -97,8 +150,199 @@ function Disconnect-DenonAVR {
         $Global:DenonStream.Close()
         $Global:DenonClient.Close()
         $Global:DenonClient = $null
+        $Global:DenonHttpOk = $false
+        $Global:DenonSsfunMap = @{}
+        $Global:DenonLastRawSi = $null
         Update-Status "Disconnected"
     }
+}
+
+function Set-DenonInputComboFromRawSi {
+    param(
+        $Combo,
+
+        [string]$RawSi
+    )
+
+    if (-not $Combo -or $Combo.Items.Count -eq 0) {
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($RawSi)) {
+        return
+    }
+
+    if ($RawSi -notmatch '(?i)^SI(.+)$') {
+        return
+    }
+
+    $suffix = $Matches[1].Trim()
+    if ($suffix.Length -eq 0) {
+        return
+    }
+
+    $idx = -1
+    for ($i = 0; $i -lt $Combo.Items.Count; $i++) {
+        $item = $Combo.Items[$i]
+        if ($null -eq $item -or -not $item.Code) {
+            continue
+        }
+
+        $codeStr = [string]$item.Code
+        if ([string]::Equals($codeStr, $suffix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $idx = $i
+            break
+        }
+    }
+
+    if ($idx -lt 0) {
+        return
+    }
+
+    if ($Combo.SelectedIndex -eq $idx) {
+        return
+    }
+
+    $Global:DenonSuppressInputComboEvent = $true
+    try {
+        $Combo.SelectedIndex = $idx
+    }
+    finally {
+        $Global:DenonSuppressInputComboEvent = $false
+    }
+}
+
+function Get-DenonSsfunDisplayForSuffix {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$SiSuffix,
+
+        [hashtable]$Map = @{}
+    )
+
+    if (-not $Map -or $Map.Count -eq 0) {
+        return $null
+    }
+
+    $s = $SiSuffix.Trim()
+    if ([string]::IsNullOrWhiteSpace($s)) {
+        return $null
+    }
+
+    foreach ($kv in $Map.GetEnumerator()) {
+        if ($kv.Key -eq $s) {
+            return $kv.Value.Trim()
+        }
+    }
+
+    foreach ($kv in $Map.GetEnumerator()) {
+        $k = $kv.Key.Trim()
+        if ($k.StartsWith($s + '/')) {
+            return $kv.Value.Trim()
+        }
+    }
+
+    return $null
+}
+
+function Convert-DenonSsfunLinesToMap {
+    param([string[]]$Lines)
+
+    $ht = @{}
+    if (-not $Lines) { return $ht }
+
+    foreach ($line in $Lines) {
+        $t = $line.Trim()
+        if ($t -match '(?i)^SSFUN\s+END\s*$') {
+            continue
+        }
+        $m = [regex]::Match($t, '(?i)^SSFUN(?<Key>[A-Za-z0-9/]+)\s+(?<Display>.+)$')
+        if (-not $m.Success) {
+            continue
+        }
+        $key = $m.Groups['Key'].Value
+        $display = $m.Groups['Display'].Value.Trim()
+        if ($display.Length -eq 0) {
+            continue
+        }
+        if ($key.Equals('END', [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        $ht[$key] = $display
+    }
+
+    return $ht
+}
+
+function Update-DenonSsfunMapFromReceiver {
+
+    $Global:DenonSsfunMap = @{}
+
+    if (-not $Global:DenonClient -or -not $Global:DenonClient.Connected -or -not $Global:DenonStream) {
+        return
+    }
+
+    while ($Global:DenonStream.DataAvailable) {
+        [void](Receive-DenonLine -TimeoutMs 50)
+    }
+
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes(('SSFUN ?' + [char]13))
+    $Global:DenonStream.Write($bytes, 0, $bytes.Length)
+
+    $allLines = New-Object System.Collections.Generic.List[string]
+    $swTot = [System.Diagnostics.Stopwatch]::StartNew()
+    $sinceData = [System.Diagnostics.Stopwatch]::StartNew()
+
+    while ($swTot.ElapsedMilliseconds -lt 7000 -and ($sinceData.ElapsedMilliseconds -lt 1100)) {
+        $ln = Receive-DenonLine -TimeoutMs 280
+        if ($ln) {
+            $allLines.Add($ln)
+            $sinceData.Reset()
+            $sinceData.Start()
+            continue
+        }
+        Start-Sleep -Milliseconds 10
+    }
+
+    $Global:DenonSsfunMap = Convert-DenonSsfunLinesToMap -Lines ($allLines.ToArray())
+}
+
+function Convert-DenonFriendlyInputWithSsfun {
+    param(
+        [string]$RawSi,
+        [string]$BaseFriendly
+    )
+
+    $map = $Global:DenonSsfunMap
+    if (-not $map -or $map.Count -eq 0) {
+        return $BaseFriendly
+    }
+
+    if ($RawSi -notmatch '(?i)^SI(.+)$') {
+        return $BaseFriendly
+    }
+
+    $suffix = $Matches[1].Trim()
+    $extra = Get-DenonSsfunDisplayForSuffix -SiSuffix $suffix -Map $map
+    if ([string]::IsNullOrWhiteSpace($extra)) {
+        return $BaseFriendly
+    }
+
+    $baseTrim = ($BaseFriendly.Trim())
+    $extraTrim = $extra.Trim()
+    if ($extraTrim.Length -eq 0) {
+        return $BaseFriendly
+    }
+
+    if ($baseTrim.Length -eq 0 -or $baseTrim -eq $RawSi.Trim()) {
+        return $extraTrim
+    }
+
+    if ($extraTrim.Equals($baseTrim, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $baseTrim
+    }
+
+    return ("{0} ({1})" -f $baseTrim, $extraTrim)
 }
 
 function Receive-DenonLine {
@@ -296,19 +540,21 @@ function Set-DenonInput {
 function Get-DenonFullStatus {
 
     if (-not $Global:DenonClient -or -not $Global:DenonClient.Connected) {
+        $Global:DenonLastRawSi = $null
         return "Not connected."
     }
 
     $rawPower   = Send-DenonQuery "PW?" "PW"
     $rawVolume  = Send-DenonQuery "MV?" "MV"
     $rawInput   = Send-DenonQuery "SI?" "SI"
+    $Global:DenonLastRawSi = $rawInput
     $rawMute    = Send-DenonQuery "MU?" "MU"
     $rawMode    = Send-DenonQuery "MS?" "MS"
     $rawChannelBlock = Send-DenonQuery "CV?" "CV"
 
     # Convert to friendly names
     $power  = Convert-DenonFriendly $rawPower  $DenonPowerMap
-    $input  = Convert-DenonFriendly $rawInput  $DenonInputMap
+    $input  = Convert-DenonFriendlyInputWithSsfun -RawSi $rawInput -BaseFriendly (Convert-DenonFriendly $rawInput $DenonInputMap)
     $mute   = Convert-DenonFriendly $rawMute   $DenonMuteMap
     $mode   = Convert-DenonFriendly $rawMode   $DenonModeMap
 
@@ -369,7 +615,7 @@ function Show-DenonGUI {
     # Main form
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Denon AVR Controller"
-    $form.Size = New-Object System.Drawing.Size(550, 750)
+    $form.Size = New-Object System.Drawing.Size(550, 705)
     $form.StartPosition = "CenterScreen"
     try {
         $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
@@ -495,26 +741,19 @@ function Show-DenonGUI {
     $cmbInput.Location = New-Object System.Drawing.Point(100,265)
     $cmbInput.Size = New-Object System.Drawing.Size(340,30)
     $cmbInput.DropDownStyle = "DropDownList"
-    $cmbInput.Items.AddRange(@("TV","BD","SAT","GAME","MPLAY","AUX1","AUX2","HEOS / Streaming"))
+    $cmbInput.Enabled = $false
     $form.Controls.Add($cmbInput)
-
-    # Set Input button
-    $btnSetInput = New-Object System.Windows.Forms.Button
-    $btnSetInput.Text = "Set Input"
-    $btnSetInput.Location = New-Object System.Drawing.Point(20,305)
-    $btnSetInput.Size = New-Object System.Drawing.Size(320,40)
-    $form.Controls.Add($btnSetInput)
 
     # Status label
     $lblStatusHeader = New-Object System.Windows.Forms.Label
     $lblStatusHeader.Text = "Receiver Status:"
-    $lblStatusHeader.Location = New-Object System.Drawing.Point(20,350)
+    $lblStatusHeader.Location = New-Object System.Drawing.Point(20,305)
     $lblStatusHeader.Size = New-Object System.Drawing.Size(200,30)
     $form.Controls.Add($lblStatusHeader)
 
     # Status box
     $txtStatus = New-Object System.Windows.Forms.TextBox
-    $txtStatus.Location = New-Object System.Drawing.Point(20,380)
+    $txtStatus.Location = New-Object System.Drawing.Point(20,338)
     $txtStatus.Size = New-Object System.Drawing.Size(500,220)
     $txtStatus.Multiline = $true
     $txtStatus.ScrollBars = "Vertical"
@@ -525,14 +764,14 @@ function Show-DenonGUI {
     # Status line
     $script:lblStatus = New-Object System.Windows.Forms.Label
     $lblStatus.Text = "Status: Not connected"
-    $lblStatus.Location = New-Object System.Drawing.Point(20,610)
+    $lblStatus.Location = New-Object System.Drawing.Point(20,565)
     $lblStatus.Size = New-Object System.Drawing.Size(400,30)
     $form.Controls.Add($lblStatus)
 
     # Refresh button
     $btnRefresh = New-Object System.Windows.Forms.Button
     $btnRefresh.Text = "Refresh Status"
-    $btnRefresh.Location = New-Object System.Drawing.Point(20,640)
+    $btnRefresh.Location = New-Object System.Drawing.Point(20,600)
     $btnRefresh.Size = New-Object System.Drawing.Size(500,40)
     $form.Controls.Add($btnRefresh)
 
@@ -558,6 +797,84 @@ function Show-DenonGUI {
     }
 
     & $updateRedZone
+
+    $populateInputCombo = {
+        param([bool]$UseSsfun)
+
+        $Global:DenonSuppressInputComboEvent = $true
+        try {
+            $map = @{}
+            if ($UseSsfun -and $Global:DenonSsfunMap -and $Global:DenonSsfunMap.Count -gt 0) {
+                $map = $Global:DenonSsfunMap.Clone()
+            }
+
+            $prevCode = $null
+            if (($null -ne $cmbInput.SelectedItem) -and $cmbInput.SelectedItem.Code) {
+                $prevCode = [string]$cmbInput.SelectedItem.Code
+            }
+
+            $cmbInput.Items.Clear()
+
+            foreach ($code in @('TV','BD','SAT','GAME','MPLAY','AUX1','AUX2','NET')) {
+                if ($code -eq 'NET') {
+                    $label = 'HEOS / Streaming'
+                }
+                else {
+                    $sd = Get-DenonSsfunDisplayForSuffix -SiSuffix $code -Map $map
+                    if ([string]::IsNullOrWhiteSpace($sd)) {
+                        $label = $code
+                    }
+                    else {
+                        $label = ('{0} ({1})' -f $code, $sd.Trim())
+                    }
+                }
+
+                [void]$cmbInput.Items.Add([pscustomobject]@{ Code = $code; Label = $label })
+            }
+
+            $cmbInput.DisplayMember = 'Label'
+
+            $selectIndex = 0
+            if ($prevCode) {
+                for ($i = 0; $i -lt $cmbInput.Items.Count; $i++) {
+                    if ($cmbInput.Items[$i].Code -eq $prevCode) {
+                        $selectIndex = $i
+                        break
+                    }
+                }
+            }
+            $cmbInput.SelectedIndex = $selectIndex
+        }
+        finally {
+            $Global:DenonSuppressInputComboEvent = $false
+        }
+    }
+
+    $cmbInput.Add_SelectedIndexChanged({
+        if ($Global:DenonSuppressInputComboEvent) {
+            return
+        }
+        if (-not ($Global:DenonClient -and $Global:DenonClient.Connected)) {
+            return
+        }
+
+        $sel = $cmbInput.SelectedItem
+        if (-not $sel) {
+            return
+        }
+
+        try {
+            if ($sel.Code -eq 'NET') {
+                Send-DenonCommand 'SINET'
+            }
+            else {
+                Send-DenonCommand ('SI{0}' -f $sel.Code)
+            }
+        }
+        catch { }
+    })
+
+    & $populateInputCombo $false
 
     # Apply full status text to UI (receiver text box, volume slider position, mute, grey out slider when muted)
     $applyReceiverStatusUi = {
@@ -600,6 +917,7 @@ function Show-DenonGUI {
         )
         $btnDisconnect.Enabled = $isConnectedUi
         $btnConnect.Enabled = (-not $isConnectedUi)
+        $cmbInput.Enabled = $isConnectedUi
 
         # Power buttons: mutually exclusive enabled state when connected; both off when disconnected
         if (-not $isConnectedUi) {
@@ -627,6 +945,10 @@ function Show-DenonGUI {
                 $btnPowerOn.Enabled = $true
                 $btnPowerOff.Enabled = $false
             }
+        }
+
+        if ($isConnectedUi -and $Global:DenonLastRawSi) {
+            Set-DenonInputComboFromRawSi -Combo $cmbInput -RawSi $Global:DenonLastRawSi
         }
 
         & $updateRedZone
@@ -747,16 +1069,6 @@ function Show-DenonGUI {
         }
     })
 
-    # Set Input button
-    $btnSetInput.Add_Click({
-        if ($cmbInput.SelectedItem) {
-            switch ($cmbInput.SelectedItem) {
-                "HEOS / Streaming" { Send-DenonCommand "SINET" }
-                default { Send-DenonCommand ("SI" + $cmbInput.SelectedItem) }
-            }
-        }
-    })
-
     # Connect button
     $btnConnect.Add_Click({
         try {
@@ -767,11 +1079,28 @@ function Show-DenonGUI {
             }
 
             Connect-DenonAVR -Address $target
-            Update-Status "Connected"
+
+            try {
+                Update-DenonSsfunMapFromReceiver
+                & $populateInputCombo $true
+            }
+            catch {
+                $Global:DenonSsfunMap = @{}
+                & $populateInputCombo $false
+            }
 
             & $applyReceiverStatusUi (Get-DenonFullStatus)
+
+            $Global:DenonHttpOk = Test-DenonHttpXmlEndpoints -HostAddress $target
+            if ($Global:DenonHttpOk) {
+                Update-Status "Connected (Telnet & HTTP)"
+            }
+            else {
+                Update-Status "Connected (Telnet)"
+            }
         } catch {
             Update-Status ("Failed to connect: " + $_.Exception.Message)
+            & $populateInputCombo $false
             & $applyReceiverStatusUi "Not connected."
         }
     })
@@ -781,17 +1110,37 @@ function Show-DenonGUI {
     $btnDisconnect.Add_Click({
         Disconnect-DenonAVR
         $lblStatus.Text = "Status: Disconnected"
+        & $populateInputCombo $false
         & $applyReceiverStatusUi "Not connected."
     })
 
     # Refresh button
     $btnRefresh.Add_Click({
+        if (-not ($Global:DenonClient -and $Global:DenonClient.Connected)) {
+            & $applyReceiverStatusUi "Not connected."
+            return
+        }
+        try {
+            Update-DenonSsfunMapFromReceiver
+            & $populateInputCombo $true
+        }
+        catch {
+            # Keep prior SSFUN map on failure so UI stays usable
+        }
+        # Get-DenonFullStatus updates DenonLastRawSi; applyReceiverStatusUi syncs the input combo to SI?
         & $applyReceiverStatusUi (Get-DenonFullStatus)
     })
 
     # Auto-populate on startup if already connected
     $form.Add_Shown({
         if ($Global:DenonClient -and $Global:DenonClient.Connected) {
+            try {
+                Update-DenonSsfunMapFromReceiver
+                & $populateInputCombo $true
+            }
+            catch {
+                & $populateInputCombo $false
+            }
             & $applyReceiverStatusUi (Get-DenonFullStatus)
         }
     })

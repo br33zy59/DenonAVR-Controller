@@ -6,6 +6,9 @@ $OutputDir   = Join-Path $ProjectRoot 'release'
 $IconFile    = Join-Path $ProjectRoot 'assets\DenonAVR.ico'
 $OutputFile  = Join-Path $OutputDir 'DenonAVR.exe'
 
+# Win32 file / assembly version (Details tab); bump alongside git tags (e.g. v1.1.0).
+$AppVersion  = '1.1.0'
+
 Import-Module ps2exe -ErrorAction Stop
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
@@ -18,6 +21,8 @@ try {
         -NoConsole `
         -STA `
         -Title 'Denon AVR Controller' `
+        -Product 'Denon AVR Controller' `
+        -version $AppVersion `
         -IconFile $IconFile
     Write-Host ("Built: " + $OutputFile)
 }
